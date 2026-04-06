@@ -6,15 +6,21 @@ const API_VERSION = "2023-06-01";
 export interface RelaySettings {
   anthropicApiKey: string;
   trivialApiKey: string;
-  maxConcurrency: number;
-  trivialMaxConcurrency: number;
   requestTimeoutMs: number;
+}
+
+export interface RequestOptions {
+  priority?: number;
+  trivial?: boolean;
+  signal?: AbortSignal;
 }
 
 const MAX_RETRIES = 2;
 const INITIAL_BACKOFF_MS = 1000;
 const MAX_QUEUE_SIZE = 64;
 const MAX_TOKENS_CAP = 32768;
+const DEFAULT_CONCURRENCY = 2;
+const MAX_CONCURRENCY_CAP = 8;
 const RESPONSE_CACHE_TTL_MS = 60_000;
 const RESPONSE_CACHE_MAX = 64;
 
@@ -46,26 +52,26 @@ function validateBody(body: object): Record<string, unknown> {
   return cleaned;
 }
 
-/** Inject prompt-caching cache_control markers onto a shallow clone of the body. */
+function tagLastElement(arr: Record<string, unknown>[]): Record<string, unknown>[] {
+  return [
+    ...arr.slice(0, -1),
+    { ...arr[arr.length - 1], cache_control: { type: "ephemeral" } },
+  ];
+}
+
 function injectCacheControl(body: Record<string, unknown>): Record<string, unknown> {
   const clone: Record<string, unknown> = { ...body };
 
-  // System prompt: ensure array form, tag last block
   if (clone.system != null) {
     if (typeof clone.system === "string") {
       clone.system = [{ type: "text", text: clone.system, cache_control: { type: "ephemeral" } }];
     } else if (Array.isArray(clone.system) && clone.system.length > 0) {
-      const blocks = (clone.system as Record<string, unknown>[]).map((b) => ({ ...b }));
-      blocks[blocks.length - 1] = { ...blocks[blocks.length - 1], cache_control: { type: "ephemeral" } };
-      clone.system = blocks;
+      clone.system = tagLastElement(clone.system as Record<string, unknown>[]);
     }
   }
 
-  // Tools: tag last tool definition
   if (Array.isArray(clone.tools) && clone.tools.length > 0) {
-    const tools = (clone.tools as Record<string, unknown>[]).map((t) => ({ ...t }));
-    tools[tools.length - 1] = { ...tools[tools.length - 1], cache_control: { type: "ephemeral" } };
-    clone.tools = tools;
+    clone.tools = tagLastElement(clone.tools as Record<string, unknown>[]);
   }
 
   return clone;
@@ -75,20 +81,25 @@ const DEFAULT_PRIORITY = 5;
 
 interface QueueEntry {
   body: Record<string, unknown>;
+  bodyKey: string;              // pre-computed JSON.stringify(body)
+  apiKey: string;               // resolved at enqueue time
+  cacheKey: string;             // apiKey + "\0" + bodyKey
   priority: number;
-  trivial: boolean;
   signal?: AbortSignal;
+  abortHandler?: () => void;    // stored so we can remove it on dispatch
   resolve: (value: Record<string, unknown>) => void;
   reject: (reason: Error) => void;
 }
 
 export interface RateLimitInfo {
+  role: "main" | "trivial";
   requestsLimit: number;
   requestsRemaining: number;
-  requestsReset: number;       // timestamp ms
+  requestsReset: number;
   tokensLimit: number;
   tokensRemaining: number;
-  tokensReset: number;         // timestamp ms
+  tokensReset: number;
+  concurrency: number;
 }
 
 interface CacheEntry {
@@ -110,7 +121,7 @@ export class Relay {
   private activeByKey = new Map<string, number>();
   private rateLimitUntil = new Map<string, number>();
   private inflight = new Map<string, Promise<Record<string, unknown>>>();
-  private rateLimits = new Map<string, RateLimitInfo>();
+  private rateLimitsRaw = new Map<string, Omit<RateLimitInfo, "role" | "concurrency">>();
   private responseCache = new Map<string, CacheEntry>();
   private stats: RelayStats = {
     totalRequests: 0,
@@ -128,46 +139,47 @@ export class Relay {
     this.settings = settings;
   }
 
-  /** Get current rate limit info for display in settings. */
-  getRateLimits(): Map<string, RateLimitInfo> {
-    return new Map(this.rateLimits);
+  getRateLimits(): RateLimitInfo[] {
+    const result: RateLimitInfo[] = [];
+    for (const [key, raw] of this.rateLimitsRaw) {
+      const role = (this.settings.trivialApiKey && key === this.settings.trivialApiKey) ? "trivial" as const : "main" as const;
+      const concurrency = Math.max(1, Math.min(MAX_CONCURRENCY_CAP, raw.requestsLimit));
+      result.push({ ...raw, role, concurrency });
+    }
+    return result;
   }
 
-  /** Get a snapshot of relay stats. */
   getStats(): RelayStats {
     return { ...this.stats };
   }
 
   /** Reject all queued entries and clear state. Call from plugin onunload. */
   shutdown(): void {
-    const entries = this.queue.splice(0);
-    for (const entry of entries) {
+    for (const entry of this.queue.splice(0)) {
+      this.cleanupAbortListener(entry);
       entry.reject(new Error("Iris Relay: plugin unloading."));
     }
     this.responseCache.clear();
     this.inflight.clear();
   }
 
-  /** Public API: enqueue a Messages API request.
-   *  @param body     Anthropic Messages API body fields.
-   *  @param priority 0-10 (lower = processed first). Defaults to 5.
-   *  @param trivial  If true and a trivial API key is configured, use that key instead.
-   *  @param signal   Optional AbortSignal to cancel the request while queued or in-flight.
-   */
-  async request(body: object, priority?: number, trivial?: boolean, signal?: AbortSignal): Promise<Record<string, unknown>> {
+  async request(body: object, options?: RequestOptions): Promise<Record<string, unknown>> {
+    const signal = options?.signal;
     if (signal?.aborted) throw new Error("Iris Relay: request aborted.");
     if (!this.settings.anthropicApiKey) throw new Error("Iris Relay: no API key configured.");
     if (this.queue.length >= MAX_QUEUE_SIZE) throw new Error("Iris Relay: queue full, try again later.");
 
     this.stats.totalRequests++;
     const validated = validateBody(body);
-    const p = typeof priority === "number" ? Math.max(0, Math.min(10, priority)) : DEFAULT_PRIORITY;
-
-    // Check response cache before queueing.
-    const apiKey = (trivial && this.settings.trivialApiKey)
+    const priority = typeof options?.priority === "number"
+      ? Math.max(0, Math.min(10, options.priority))
+      : DEFAULT_PRIORITY;
+    const apiKey = (options?.trivial && this.settings.trivialApiKey)
       ? this.settings.trivialApiKey
       : this.settings.anthropicApiKey;
-    const cacheKey = apiKey + "\0" + JSON.stringify(validated);
+    const bodyKey = JSON.stringify(validated);
+    const cacheKey = apiKey + "\0" + bodyKey;
+
     const cached = this.responseCache.get(cacheKey);
     if (cached && Date.now() < cached.expiresAt) {
       this.stats.cacheHits++;
@@ -175,37 +187,40 @@ export class Relay {
     }
 
     return new Promise<Record<string, unknown>>((resolve, reject) => {
-      const entry: QueueEntry = { body: validated, priority: p, trivial: !!trivial, signal, resolve, reject };
+      const entry: QueueEntry = {
+        body: validated, bodyKey, apiKey, cacheKey, priority, signal, resolve, reject,
+      };
 
-      // If aborted while queued, remove from queue and reject.
       if (signal) {
-        signal.addEventListener("abort", () => {
+        const handler = () => {
           const idx = this.queue.indexOf(entry);
           if (idx !== -1) {
             this.queue.splice(idx, 1);
             reject(new Error("Iris Relay: request aborted."));
           }
-        }, { once: true });
+        };
+        entry.abortHandler = handler;
+        signal.addEventListener("abort", handler, { once: true });
       }
 
-      let i = this.queue.findIndex((e) => e.priority > p);
+      let i = this.queue.findIndex((e) => e.priority > priority);
       if (i === -1) i = this.queue.length;
       this.queue.splice(i, 0, entry);
       this.drain();
     });
   }
 
-  private resolveKey(entry: QueueEntry): string {
-    return (entry.trivial && this.settings.trivialApiKey)
-      ? this.settings.trivialApiKey
-      : this.settings.anthropicApiKey;
+  private cleanupAbortListener(entry: QueueEntry): void {
+    if (entry.signal && entry.abortHandler) {
+      entry.signal.removeEventListener("abort", entry.abortHandler);
+      entry.abortHandler = undefined;
+    }
   }
 
   private maxConcurrencyFor(apiKey: string): number {
-    if (this.settings.trivialApiKey && apiKey === this.settings.trivialApiKey) {
-      return this.settings.trivialMaxConcurrency;
-    }
-    return this.settings.maxConcurrency;
+    const info = this.rateLimitsRaw.get(apiKey);
+    if (!info) return DEFAULT_CONCURRENCY;
+    return Math.max(1, Math.min(MAX_CONCURRENCY_CAP, info.requestsLimit));
   }
 
   private getActive(apiKey: string): number {
@@ -218,24 +233,19 @@ export class Relay {
 
   private drain(): void {
     const now = Date.now();
-
-    // Track the earliest rate-limit expiry we skip, so we can schedule a retry.
     let earliestRetry = Infinity;
 
-    // Walk the queue and dispatch entries whose key has capacity.
     let i = 0;
     while (i < this.queue.length) {
       const entry = this.queue[i];
 
-      // Already aborted while queued — discard silently (reject fired by listener).
       if (entry.signal?.aborted) {
         this.queue.splice(i, 1);
         continue;
       }
 
-      const apiKey = this.resolveKey(entry);
+      const { apiKey } = entry;
 
-      // Rate-limited for this key?
       const rlUntil = this.rateLimitUntil.get(apiKey) || 0;
       if (now < rlUntil) {
         earliestRetry = Math.min(earliestRetry, rlUntil);
@@ -243,23 +253,21 @@ export class Relay {
         continue;
       }
 
-      // Concurrency full for this key?
       if (this.getActive(apiKey) >= this.maxConcurrencyFor(apiKey)) {
         i++;
         continue;
       }
 
-      // Approaching rate limit — delay if near capacity.
       if (this.shouldThrottle(apiKey)) {
         earliestRetry = Math.min(earliestRetry, now + 2000);
         i++;
         continue;
       }
 
-      // Dispatch this entry.
       this.queue.splice(i, 1);
+      this.cleanupAbortListener(entry);
       this.adjustActive(apiKey, 1);
-      this.execute(entry, apiKey).finally(() => {
+      this.execute(entry).finally(() => {
         this.adjustActive(apiKey, -1);
         this.drain();
       });
@@ -270,22 +278,18 @@ export class Relay {
     }
   }
 
-  /** Check if we should throttle based on API-reported remaining capacity. */
   private shouldThrottle(apiKey: string): boolean {
-    const info = this.rateLimits.get(apiKey);
-    if (!info) return false; // no data yet — let it through
+    const info = this.rateLimitsRaw.get(apiKey);
+    if (!info) return false;
 
     const now = Date.now();
-    // If the window has reset, limits are refreshed — don't throttle.
     if (now >= info.tokensReset && now >= info.requestsReset) return false;
 
-    // Throttle when remaining tokens or requests drop below 10% of limit.
     if (info.tokensRemaining < info.tokensLimit * 0.1) return true;
     if (info.requestsRemaining < info.requestsLimit * 0.1) return true;
     return false;
   }
 
-  /** Parse rate-limit headers from an API response. */
   private updateRateLimits(apiKey: string, headers: Record<string, string>): void {
     const h = (name: string) => headers?.[name] || "";
     const parseReset = (val: string): number => {
@@ -295,14 +299,13 @@ export class Relay {
     };
 
     const requestsLimit = parseInt(h("anthropic-ratelimit-requests-limit"), 10);
-    const requestsRemaining = parseInt(h("anthropic-ratelimit-requests-remaining"), 10);
     const tokensLimit = parseInt(h("anthropic-ratelimit-tokens-limit"), 10);
-    const tokensRemaining = parseInt(h("anthropic-ratelimit-tokens-remaining"), 10);
-
-    // Only update if we got valid numbers back.
     if (isNaN(requestsLimit) || isNaN(tokensLimit)) return;
 
-    this.rateLimits.set(apiKey, {
+    const requestsRemaining = parseInt(h("anthropic-ratelimit-requests-remaining"), 10);
+    const tokensRemaining = parseInt(h("anthropic-ratelimit-tokens-remaining"), 10);
+
+    this.rateLimitsRaw.set(apiKey, {
       requestsLimit,
       requestsRemaining: isNaN(requestsRemaining) ? requestsLimit : requestsRemaining,
       requestsReset: parseReset(h("anthropic-ratelimit-requests-reset")),
@@ -312,14 +315,11 @@ export class Relay {
     });
   }
 
-  /** Store a response in the cache, evicting oldest if at capacity. */
   private cacheResponse(key: string, response: Record<string, unknown>): void {
-    // Evict expired entries first.
     const now = Date.now();
     for (const [k, v] of this.responseCache) {
       if (now >= v.expiresAt) this.responseCache.delete(k);
     }
-    // If still at capacity, evict the oldest (first inserted).
     if (this.responseCache.size >= RESPONSE_CACHE_MAX) {
       const first = this.responseCache.keys().next().value;
       if (first !== undefined) this.responseCache.delete(first);
@@ -327,14 +327,11 @@ export class Relay {
     this.responseCache.set(key, { response, expiresAt: now + RESPONSE_CACHE_TTL_MS });
   }
 
-  private async execute(entry: QueueEntry, apiKey: string): Promise<void> {
-    // --- Request deduplication ---
-    const dedupKey = apiKey + "\0" + JSON.stringify(entry.body);
-    const existing = this.inflight.get(dedupKey);
+  private async execute(entry: QueueEntry): Promise<void> {
+    const existing = this.inflight.get(entry.cacheKey);
     if (existing) {
       this.stats.dedupHits++;
-      // Piggyback on the in-flight request — don't consume a concurrency slot.
-      this.adjustActive(apiKey, -1);
+      this.adjustActive(entry.apiKey, -1);
       try {
         entry.resolve(await existing);
       } catch (e) {
@@ -343,18 +340,17 @@ export class Relay {
       return;
     }
 
-    const promise = this.executeInner(entry, apiKey);
-    this.inflight.set(dedupKey, promise);
-    promise.finally(() => this.inflight.delete(dedupKey));
+    const promise = this.executeInner(entry);
+    this.inflight.set(entry.cacheKey, promise);
+    promise.finally(() => this.inflight.delete(entry.cacheKey));
 
     try {
       await promise;
     } catch {
-      // rejection already forwarded to entry inside executeInner
+      // rejection already forwarded inside executeInner
     }
   }
 
-  /** Handle 429 or 529 with retry-after backoff. */
   private applyOverloadBackoff(apiKey: string, headers: Record<string, string>, status: number): Error {
     const retryAfter = parseInt(headers?.["retry-after"] || "", 10);
     const backoffMs = (isNaN(retryAfter) ? 10 : retryAfter) * 1000;
@@ -363,22 +359,13 @@ export class Relay {
     return new Error(`Iris Relay: ${label} (${status}), backing off ${backoffMs / 1000}s`);
   }
 
-  private async executeInner(entry: QueueEntry, apiKey: string): Promise<Record<string, unknown>> {
+  private async executeInner(entry: QueueEntry): Promise<Record<string, unknown>> {
     let lastError: Error | null = null;
-    const cachedBody = injectCacheControl(entry.body);
-    const cacheKey = apiKey + "\0" + JSON.stringify(entry.body);
-
-    // Helper: create an abort promise that rejects when the signal fires.
-    const abortPromise = entry.signal
-      ? new Promise<never>((_, reject) => {
-          entry.signal!.addEventListener("abort", () =>
-            reject(new Error("Iris Relay: request aborted.")), { once: true });
-        })
-      : null;
+    const serializedBody = JSON.stringify(injectCacheControl(entry.body));
+    const { apiKey, cacheKey, signal } = entry;
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-      // Check abort before each attempt.
-      if (entry.signal?.aborted) {
+      if (signal?.aborted) {
         const err = new Error("Iris Relay: request aborted.");
         entry.reject(err);
         throw err;
@@ -390,13 +377,13 @@ export class Relay {
         await new Promise((r) => setTimeout(r, delay));
       }
 
-      // Re-check rate limit before each attempt
       const now = Date.now();
       const rlUntil = this.rateLimitUntil.get(apiKey) || 0;
       if (now < rlUntil) {
         await new Promise((r) => setTimeout(r, rlUntil - now));
       }
 
+      let timeoutId: ReturnType<typeof setTimeout> | undefined;
       try {
         const racers: Promise<any>[] = [
           requestUrl({
@@ -408,20 +395,21 @@ export class Relay {
               "anthropic-version": API_VERSION,
               "anthropic-beta": "prompt-caching-2024-07-31",
             },
-            body: JSON.stringify(cachedBody),
+            body: serializedBody,
             throw: false,
           }),
-          new Promise<never>((_, reject) =>
-            setTimeout(
+          new Promise<never>((_, reject) => {
+            timeoutId = setTimeout(
               () => reject(new Error(`Iris Relay: request timed out after ${this.settings.requestTimeoutMs / 1000}s`)),
               this.settings.requestTimeoutMs,
-            ),
-          ),
+            );
+          }),
         ];
-        if (abortPromise) racers.push(abortPromise);
+
+        // Race against abort without a persistent promise — just check the flag
+        // before each attempt (above) and let the timeout bound any hanging request.
         const response = await Promise.race(racers);
 
-        // Update rate-limit state from response headers.
         this.updateRateLimits(apiKey, response.headers);
 
         if (response.status === 429 || response.status === 529) {
@@ -451,6 +439,8 @@ export class Relay {
           continue;
         }
         if (attempt >= MAX_RETRIES) break;
+      } finally {
+        if (timeoutId !== undefined) clearTimeout(timeoutId);
       }
     }
 
