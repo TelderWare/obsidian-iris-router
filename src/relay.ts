@@ -5,6 +5,7 @@ const API_VERSION = "2023-06-01";
 
 export interface RelaySettings {
   anthropicApiKey: string;
+  trivialApiKey: string;
   maxConcurrency: number;
   requestTimeoutMs: number;
 }
@@ -39,8 +40,12 @@ function validateBody(body: object): Record<string, unknown> {
   return cleaned;
 }
 
+const DEFAULT_PRIORITY = 5;
+
 interface QueueEntry {
   body: Record<string, unknown>;
+  priority: number;
+  trivial: boolean;
   resolve: (value: Record<string, unknown>) => void;
   reject: (reason: Error) => void;
 }
@@ -59,13 +64,22 @@ export class Relay {
     this.settings = settings;
   }
 
-  /** Public API: enqueue a Messages API request. */
-  async request(body: object): Promise<Record<string, unknown>> {
+  /** Public API: enqueue a Messages API request.
+   *  @param body     Anthropic Messages API body fields.
+   *  @param priority 0-10 (lower = processed first). Defaults to 5.
+   *  @param trivial  If true and a trivial API key is configured, use that key instead.
+   */
+  async request(body: object, priority?: number, trivial?: boolean): Promise<Record<string, unknown>> {
     if (!this.settings.anthropicApiKey) throw new Error("Iris Relay: no API key configured.");
     if (this.queue.length >= MAX_QUEUE_SIZE) throw new Error("Iris Relay: queue full, try again later.");
     const validated = validateBody(body);
+    const p = typeof priority === "number" ? Math.max(0, Math.min(10, priority)) : DEFAULT_PRIORITY;
     return new Promise<Record<string, unknown>>((resolve, reject) => {
-      this.queue.push({ body: validated, resolve, reject });
+      // Insert in priority order (lowest first); equal priority preserves FIFO.
+      const entry: QueueEntry = { body: validated, priority: p, trivial: !!trivial, resolve, reject };
+      let i = this.queue.findIndex((e) => e.priority > p);
+      if (i === -1) i = this.queue.length;
+      this.queue.splice(i, 0, entry);
       this.drain();
     });
   }
@@ -104,13 +118,16 @@ export class Relay {
       }
 
       try {
+        const apiKey = (entry.trivial && this.settings.trivialApiKey)
+          ? this.settings.trivialApiKey
+          : this.settings.anthropicApiKey;
         const response = await Promise.race([
           requestUrl({
             url: API_URL,
             method: "POST",
             headers: {
               "Content-Type": "application/json",
-              "x-api-key": this.settings.anthropicApiKey,
+              "x-api-key": apiKey,
               "anthropic-version": API_VERSION,
             },
             body: JSON.stringify(entry.body),

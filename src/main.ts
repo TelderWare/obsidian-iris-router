@@ -28,12 +28,14 @@ function decryptSecret(stored: string): string {
 
 interface IrisRelaySettings {
   anthropicApiKey: string;
+  trivialApiKey: string;
   maxConcurrency: number;
   requestTimeoutSec: number;
 }
 
 const DEFAULT_SETTINGS: IrisRelaySettings = {
   anthropicApiKey: "",
+  trivialApiKey: "",
   maxConcurrency: 2,
   requestTimeoutSec: 60,
 };
@@ -58,6 +60,7 @@ export default class IrisRelayPlugin extends Plugin {
   private relaySettings(): RelaySettings {
     return {
       anthropicApiKey: this.settings.anthropicApiKey,
+      trivialApiKey: this.settings.trivialApiKey,
       maxConcurrency: this.settings.maxConcurrency,
       requestTimeoutMs: this.settings.requestTimeoutSec * 1000,
     };
@@ -66,12 +69,14 @@ export default class IrisRelayPlugin extends Plugin {
   async loadSettings(): Promise<void> {
     const raw = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
     raw.anthropicApiKey = decryptSecret(raw.anthropicApiKey);
+    raw.trivialApiKey = decryptSecret(raw.trivialApiKey || "");
     this.settings = raw;
   }
 
   async saveSettings(): Promise<void> {
     const toSave = { ...this.settings };
     toSave.anthropicApiKey = encryptSecret(toSave.anthropicApiKey);
+    toSave.trivialApiKey = encryptSecret(toSave.trivialApiKey);
     await this.saveData(toSave);
     this.relay.updateSettings(this.relaySettings());
   }
@@ -105,6 +110,16 @@ class IrisRelaySettingTab extends PluginSettingTab {
         t.setPlaceholder("sk-ant-...")
           .setValue(s.anthropicApiKey)
           .onChange(async (v) => { s.anthropicApiKey = v.trim(); await save(); });
+      });
+
+    new Setting(containerEl)
+      .setName("Trivial API key")
+      .setDesc("Optional separate API key for trivial calls (e.g. nickname generation). Falls back to the main key when empty.")
+      .addText(t => {
+        t.inputEl.type = "password";
+        t.setPlaceholder("sk-ant-...")
+          .setValue(s.trivialApiKey)
+          .onChange(async (v) => { s.trivialApiKey = v.trim(); await save(); });
       });
 
     new Setting(containerEl)
