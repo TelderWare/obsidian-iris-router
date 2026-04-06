@@ -30,6 +30,7 @@ interface IrisRelaySettings {
   anthropicApiKey: string;
   trivialApiKey: string;
   maxConcurrency: number;
+  trivialMaxConcurrency: number;
   requestTimeoutSec: number;
 }
 
@@ -37,6 +38,7 @@ const DEFAULT_SETTINGS: IrisRelaySettings = {
   anthropicApiKey: "",
   trivialApiKey: "",
   maxConcurrency: 2,
+  trivialMaxConcurrency: 2,
   requestTimeoutSec: 60,
 };
 
@@ -54,6 +56,7 @@ export default class IrisRelayPlugin extends Plugin {
   }
 
   onunload(): void {
+    this.relay.shutdown();
     delete (this.app as any).irisRelay;
   }
 
@@ -62,6 +65,7 @@ export default class IrisRelayPlugin extends Plugin {
       anthropicApiKey: this.settings.anthropicApiKey,
       trivialApiKey: this.settings.trivialApiKey,
       maxConcurrency: this.settings.maxConcurrency,
+      trivialMaxConcurrency: this.settings.trivialMaxConcurrency,
       requestTimeoutMs: this.settings.requestTimeoutSec * 1000,
     };
   }
@@ -119,12 +123,16 @@ class IrisRelaySettingTab extends PluginSettingTab {
         t.inputEl.type = "password";
         t.setPlaceholder("sk-ant-...")
           .setValue(s.trivialApiKey)
-          .onChange(async (v) => { s.trivialApiKey = v.trim(); await save(); });
+          .onChange(async (v) => {
+            s.trivialApiKey = v.trim();
+            await save();
+            this.display(); // re-render to show/hide trivial concurrency
+          });
       });
 
     new Setting(containerEl)
       .setName("Max concurrency")
-      .setDesc("Maximum simultaneous API requests. Lower values reduce rate-limit risk.")
+      .setDesc("Maximum simultaneous API requests for the main key. Lower values reduce rate-limit risk.")
       .addDropdown(d =>
         d.addOption("1", "1")
           .addOption("2", "2")
@@ -132,6 +140,19 @@ class IrisRelaySettingTab extends PluginSettingTab {
           .addOption("4", "4")
           .setValue(String(s.maxConcurrency))
           .onChange(async (v) => { s.maxConcurrency = parseInt(v, 10); await save(); }));
+
+    if (s.trivialApiKey) {
+      new Setting(containerEl)
+        .setName("Trivial max concurrency")
+        .setDesc("Maximum simultaneous API requests for the trivial key. Haiku rate limits are more generous, so this can safely be higher.")
+        .addDropdown(d =>
+          d.addOption("1", "1")
+            .addOption("2", "2")
+            .addOption("3", "3")
+            .addOption("4", "4")
+            .setValue(String(s.trivialMaxConcurrency))
+            .onChange(async (v) => { s.trivialMaxConcurrency = parseInt(v, 10); await save(); }));
+    }
 
     new Setting(containerEl)
       .setName("Request timeout")
@@ -143,5 +164,32 @@ class IrisRelaySettingTab extends PluginSettingTab {
           .addOption("120", "120s")
           .setValue(String(s.requestTimeoutSec))
           .onChange(async (v) => { s.requestTimeoutSec = parseInt(v, 10); await save(); }));
+
+    // Rate limit info display (from API response headers)
+    const limits = this.plugin.relay.getRateLimits();
+    if (limits.size > 0) {
+      containerEl.createEl("h4", { text: "API rate limits" });
+      for (const [key, info] of limits) {
+        const label = key === s.anthropicApiKey ? "Main key" : "Trivial key";
+        const reqPct = info.requestsLimit > 0 ? Math.round(info.requestsRemaining / info.requestsLimit * 100) : 100;
+        const tokPct = info.tokensLimit > 0 ? Math.round(info.tokensRemaining / info.tokensLimit * 100) : 100;
+        const desc = `Requests: ${info.requestsRemaining.toLocaleString()} / ${info.requestsLimit.toLocaleString()} remaining (${reqPct}%) · Tokens: ${info.tokensRemaining.toLocaleString()} / ${info.tokensLimit.toLocaleString()} remaining (${tokPct}%)`;
+        new Setting(containerEl).setName(label).setDesc(desc);
+      }
+    }
+
+    // Stats display
+    const stats = this.plugin.relay.getStats();
+    if (stats.totalRequests > 0) {
+      containerEl.createEl("h4", { text: "Session stats" });
+      const parts = [
+        `${stats.totalRequests} requests`,
+        `${stats.dedupHits} dedup hits`,
+        `${stats.cacheHits} cache hits`,
+        `${stats.retries} retries`,
+        `${stats.errors} errors`,
+      ];
+      new Setting(containerEl).setName("Totals").setDesc(parts.join(" · "));
+    }
   }
 }
