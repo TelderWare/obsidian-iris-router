@@ -1,0 +1,9 @@
+{
+  "id": "iris-relay",
+  "name": "Iris AI Router",
+  "version": "0.1.0",
+  "minAppVersion": "1.4.0",
+  "description": "Unified AI API router for iris plugins — single API key, request queuing, and rate-limit coordination.",
+  "author": "mgodd",
+  "isDesktopOnly": false
+}
