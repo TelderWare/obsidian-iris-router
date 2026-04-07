@@ -1,6 +1,6 @@
 {
-  "id": "iris-obsidian-ai",
-  "name": "Iris AI Router",
+  "id": "obsidian-iris-router",
+  "name": "Iris Router",
   "version": "0.1.0",
   "minAppVersion": "1.4.0",
   "description": "Unified AI API router for iris plugins — single API key, request queuing, and rate-limit coordination.",
