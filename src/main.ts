@@ -2,25 +2,26 @@ import { App, Notice, Plugin, PluginSettingTab, Setting } from "obsidian";
 import { Relay } from "./relay";
 import type { RelaySettings } from "./relay";
 
-function encryptSecret(key: string): string {
-  if (!key) return "";
-  try {
-    const { safeStorage } = require("electron");
-    if (safeStorage.isEncryptionAvailable()) {
-      return "enc:" + safeStorage.encryptString(key).toString("base64");
-    }
-  } catch { /* safeStorage unavailable */ }
-  return key;
+const SECRET_KEY_ANTHROPIC = "iris-router-anthropic-api-key";
+const SECRET_KEY_TRIVIAL = "iris-router-trivial-api-key";
+
+function getSecret(app: App, key: string): string {
+  return (app as any).vault?.secretStorage?.getSecret?.(key) ?? "";
 }
 
-function decryptSecret(stored: string): string {
+function setSecret(app: App, key: string, value: string): void {
+  (app as any).vault?.secretStorage?.setSecret?.(key, value ?? "");
+}
+
+// Legacy decrypt — used once during migration to drain keys out of data.json.
+function legacyDecrypt(stored: string): string {
   if (!stored) return "";
   if (stored.startsWith("enc:")) {
     try {
       const { safeStorage } = require("electron");
       return safeStorage.decryptString(Buffer.from(stored.slice(4), "base64"));
     } catch {
-      new Notice("Iris Relay: unable to decrypt API key. Please re-enter it in settings.");
+      new Notice("Iris Relay: unable to migrate legacy API key. Please re-enter it in settings.");
       return "";
     }
   }
@@ -28,19 +29,20 @@ function decryptSecret(stored: string): string {
 }
 
 interface IrisRelaySettings {
-  anthropicApiKey: string;
-  trivialApiKey: string;
   requestTimeoutSec: number;
+  // Legacy fields, only present in data.json from older versions. Migrated and cleared on load.
+  anthropicApiKey?: string;
+  trivialApiKey?: string;
 }
 
 const DEFAULT_SETTINGS: IrisRelaySettings = {
-  anthropicApiKey: "",
-  trivialApiKey: "",
   requestTimeoutSec: 60,
 };
 
 export default class IrisRelayPlugin extends Plugin {
   settings!: IrisRelaySettings;
+  anthropicApiKey = "";
+  trivialApiKey = "";
   relay!: Relay;
 
   async onload(): Promise<void> {
@@ -59,24 +61,41 @@ export default class IrisRelayPlugin extends Plugin {
 
   private relaySettings(): RelaySettings {
     return {
-      anthropicApiKey: this.settings.anthropicApiKey,
-      trivialApiKey: this.settings.trivialApiKey,
+      anthropicApiKey: this.anthropicApiKey,
+      trivialApiKey: this.trivialApiKey,
       requestTimeoutMs: this.settings.requestTimeoutSec * 1000,
     };
   }
 
   async loadSettings(): Promise<void> {
     const raw = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-    raw.anthropicApiKey = decryptSecret(raw.anthropicApiKey);
-    raw.trivialApiKey = decryptSecret(raw.trivialApiKey || "");
+
+    // Migrate legacy keys out of data.json into vault.secretStorage.
+    let migrated = false;
+    if (raw.anthropicApiKey) {
+      const decrypted = legacyDecrypt(raw.anthropicApiKey);
+      if (decrypted) setSecret(this.app, SECRET_KEY_ANTHROPIC, decrypted);
+      delete raw.anthropicApiKey;
+      migrated = true;
+    }
+    if (raw.trivialApiKey) {
+      const decrypted = legacyDecrypt(raw.trivialApiKey);
+      if (decrypted) setSecret(this.app, SECRET_KEY_TRIVIAL, decrypted);
+      delete raw.trivialApiKey;
+      migrated = true;
+    }
+
     this.settings = raw;
+    this.anthropicApiKey = getSecret(this.app, SECRET_KEY_ANTHROPIC);
+    this.trivialApiKey = getSecret(this.app, SECRET_KEY_TRIVIAL);
+
+    if (migrated) await this.saveData(this.settings);
   }
 
   async saveSettings(): Promise<void> {
-    const toSave = { ...this.settings };
-    toSave.anthropicApiKey = encryptSecret(toSave.anthropicApiKey);
-    toSave.trivialApiKey = encryptSecret(toSave.trivialApiKey);
-    await this.saveData(toSave);
+    setSecret(this.app, SECRET_KEY_ANTHROPIC, this.anthropicApiKey);
+    setSecret(this.app, SECRET_KEY_TRIVIAL, this.trivialApiKey);
+    await this.saveData(this.settings);
     this.relay.updateSettings(this.relaySettings());
   }
 }
@@ -92,7 +111,6 @@ class IrisRelaySettingTab extends PluginSettingTab {
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
-    const s = this.plugin.settings;
     const save = () => this.plugin.saveSettings();
 
     containerEl.createEl("h3", { text: "Iris AI Router" });
@@ -103,12 +121,12 @@ class IrisRelaySettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Anthropic API key")
-      .setDesc("Shared API key used by all iris plugins routed through this relay.")
+      .setDesc("Shared API key used by all iris plugins routed through this relay. Stored in the vault's secret storage, not in data.json.")
       .addText(t => {
         t.inputEl.type = "password";
         t.setPlaceholder("sk-ant-...")
-          .setValue(s.anthropicApiKey)
-          .onChange(async (v) => { s.anthropicApiKey = v.trim(); await save(); });
+          .setValue(this.plugin.anthropicApiKey)
+          .onChange(async (v) => { this.plugin.anthropicApiKey = v.trim(); await save(); });
       });
 
     new Setting(containerEl)
@@ -117,8 +135,8 @@ class IrisRelaySettingTab extends PluginSettingTab {
       .addText(t => {
         t.inputEl.type = "password";
         t.setPlaceholder("sk-ant-...")
-          .setValue(s.trivialApiKey)
-          .onChange(async (v) => { s.trivialApiKey = v.trim(); await save(); });
+          .setValue(this.plugin.trivialApiKey)
+          .onChange(async (v) => { this.plugin.trivialApiKey = v.trim(); await save(); });
       });
 
     new Setting(containerEl)
@@ -129,8 +147,8 @@ class IrisRelaySettingTab extends PluginSettingTab {
           .addOption("60", "60s")
           .addOption("90", "90s")
           .addOption("120", "120s")
-          .setValue(String(s.requestTimeoutSec))
-          .onChange(async (v) => { s.requestTimeoutSec = parseInt(v, 10); await save(); }));
+          .setValue(String(this.plugin.settings.requestTimeoutSec))
+          .onChange(async (v) => { this.plugin.settings.requestTimeoutSec = parseInt(v, 10); await save(); }));
 
     const limits = this.plugin.relay.getRateLimits();
     if (limits.length > 0) {
