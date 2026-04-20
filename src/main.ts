@@ -71,7 +71,16 @@ export default class IrisRelayPlugin extends Plugin {
         font-variant-numeric: tabular-nums;
         margin-bottom: 14px;
       }
+      .iris-modal-status { display: flex; align-items: center; gap: 8px; }
       .iris-modal-status.is-active { color: var(--interactive-accent); font-weight: 600; }
+      .iris-modal-status.is-paused { color: var(--text-warning, var(--text-accent)); font-weight: 600; }
+      .iris-pause-btn {
+        margin-left: auto;
+        font-size: 11px;
+        padding: 2px 8px;
+        height: auto;
+        line-height: 1.4;
+      }
 
       .iris-section { margin-bottom: 16px; }
       .iris-section-title {
@@ -491,15 +500,29 @@ class IrisLiveModal extends Modal {
     const status = root.createDiv({ cls: "iris-modal-status" });
     const activeCount = snap.active.length;
     const queuedCount = snap.queued.length;
-    if (activeCount > 0 || queuedCount > 0) {
+    const paused = this.relay.isPaused();
+    const label = status.createSpan();
+    if (paused) {
+      status.addClass("is-paused");
+      const parts = [`paused`];
+      if (activeCount > 0) parts.push(`${activeCount} in flight`);
+      if (queuedCount > 0) parts.push(`${queuedCount} queued`);
+      label.textContent = parts.join(" · ");
+    } else if (activeCount > 0 || queuedCount > 0) {
       status.addClass("is-active");
       const parts: string[] = [];
       if (activeCount > 0) parts.push(`${activeCount} in flight`);
       if (queuedCount > 0) parts.push(`${queuedCount} queued`);
-      status.textContent = parts.join(" · ");
+      label.textContent = parts.join(" · ");
     } else {
-      status.textContent = "idle";
+      label.textContent = "idle";
     }
+    const pauseBtn = status.createEl("button", {
+      cls: "iris-pause-btn",
+      text: paused ? "Resume" : "Pause",
+      attr: { title: paused ? "Resume dispatching queued requests" : "Stop dispatching queued requests" },
+    });
+    pauseBtn.addEventListener("click", () => this.relay.setPaused(!paused));
 
     if (limits.length > 0) {
       const sec = this.section(root, "Rate limits");
@@ -611,8 +634,9 @@ class IrisLiveModal extends Modal {
       span.createSpan({ text: `${label} ` });
       span.createEl("b", { text: typeof v === "number" ? this.fmtNum(v) : v });
     };
-    fitem("Total", s.totalRequests);
-    fitem("Errors", s.errors);
+    fitem("Requests", s.totalRequests);
+    fitem("Attempts", s.attempts);
+    fitem("Failures", s.errors);
     fitem("Input", this.fmtTokens(totalIn));
     fitem("Output", this.fmtTokens(totalOut));
     if (totalCache > 0) fitem("Cache read", this.fmtTokens(totalCache));

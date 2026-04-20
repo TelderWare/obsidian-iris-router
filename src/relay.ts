@@ -217,6 +217,7 @@ interface CacheEntry {
 
 export interface RelayStats {
   totalRequests: number;
+  attempts: number;
   errors: number;
 }
 
@@ -229,11 +230,13 @@ export class Relay {
   private changeListener?: () => void;
   private changePending = false;
   private drainScheduled = false;
+  private paused = false;
   private rateLimitUntil = new Map<string, number>();
   private rateLimitsRaw = new Map<string, Omit<RateLimitInfo, "role" | "concurrency">>();
   private responseCache = new Map<string, CacheEntry>();
   private stats: RelayStats = {
     totalRequests: 0,
+    attempts: 0,
     errors: 0,
   };
 
@@ -399,7 +402,19 @@ export class Relay {
     return this.activeTotal;
   }
 
+  isPaused(): boolean {
+    return this.paused;
+  }
+
+  setPaused(paused: boolean): void {
+    if (this.paused === paused) return;
+    this.paused = paused;
+    this.notifyChange();
+    if (!paused) this.scheduleDrain();
+  }
+
   private drain(): void {
+    if (this.paused) return;
     const now = Date.now();
     let earliestRetry = Infinity;
 
@@ -528,19 +543,20 @@ export class Relay {
     const serializedBody = JSON.stringify(injectCacheControl(entry.body));
     const { apiKey, cacheKey, signal } = entry;
 
+    const fail = (err: Error, status: HistoryEntry["status"]): never => {
+      (err as any).__irisHandled = true;
+      if (status === "error") {
+        this.stats.errors++;
+        this.bumpCaller(record.callerId, "errors", 1);
+      }
+      entry.reject(err);
+      this.recordHistory(record, status, undefined, err.message);
+      throw err;
+    };
+
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-      if (record.cancelled) {
-        const err = new Error("Iris Relay: request cancelled.");
-        entry.reject(err);
-        this.recordHistory(record, "cancelled", undefined, err.message);
-        throw err;
-      }
-      if (signal?.aborted) {
-        const err = new Error("Iris Relay: request aborted.");
-        entry.reject(err);
-        this.recordHistory(record, "cancelled", undefined, err.message);
-        throw err;
-      }
+      if (record.cancelled) fail(new Error("Iris Relay: request cancelled."), "cancelled");
+      if (signal?.aborted) fail(new Error("Iris Relay: request aborted."), "cancelled");
 
       if (attempt > 0) {
         this.bumpCaller(record.callerId, "retries", 1);
@@ -555,6 +571,7 @@ export class Relay {
       }
 
       let timeoutId: ReturnType<typeof setTimeout> | undefined;
+      this.stats.attempts++;
       try {
         const racers: Promise<any>[] = [
           requestUrl({
@@ -581,12 +598,7 @@ export class Relay {
         // before each attempt (above) and let the timeout bound any hanging request.
         const response = await Promise.race(racers);
 
-        if (record.cancelled) {
-          const err = new Error("Iris Relay: request cancelled.");
-          entry.reject(err);
-          this.recordHistory(record, "cancelled", undefined, err.message);
-          throw err;
-        }
+        if (record.cancelled) fail(new Error("Iris Relay: request cancelled."), "cancelled");
 
         this.updateRateLimits(apiKey, response.headers);
 
@@ -602,12 +614,7 @@ export class Relay {
 
         if (response.status >= 400) {
           const msg = response.json?.error?.message ?? `API ${response.status}`;
-          const err = new Error(`Iris Relay: ${msg}`);
-          this.stats.errors++;
-          this.bumpCaller(record.callerId, "errors", 1);
-          entry.reject(err);
-          this.recordHistory(record, "error", undefined, err.message);
-          throw err;
+          fail(new Error(`Iris Relay: ${msg}`), "error");
         }
 
         this.cacheResponse(cacheKey, response.json);
@@ -615,6 +622,7 @@ export class Relay {
         this.recordHistory(record, "ok", response.json);
         return response.json;
       } catch (e) {
+        if (e instanceof Error && (e as any).__irisHandled) throw e;
         lastError = e instanceof Error ? e : new Error(String(e));
         if (attempt < MAX_RETRIES && lastError.message.includes("timed out")) {
           continue;
@@ -625,12 +633,8 @@ export class Relay {
       }
     }
 
-    this.stats.errors++;
-    this.bumpCaller(record.callerId, "errors", 1);
-    const err = lastError || new Error("Iris Relay: all retries exhausted");
-    entry.reject(err);
-    this.recordHistory(record, "error", undefined, err.message);
-    throw err;
+    fail(lastError || new Error("Iris Relay: all retries exhausted"), "error");
+    throw lastError; // unreachable, for type narrowing
   }
 
   // ───── stats / history helpers ─────
