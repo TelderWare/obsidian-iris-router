@@ -1,4 +1,10 @@
-import { requestUrl } from "obsidian";
+import { Notice, requestUrl } from "obsidian";
+import { HFClient, type HFRequestOptions, type ZeroShotResult, type NLIResult } from "./hf";
+import {
+  OpenAIClient, MistralClient, GroqClient, GeminiClient, HFChatClient, ElevenLabsClient,
+  type ClientRequestOptions, type ProviderCallStats, type ElevenLabsVoice,
+  type STTStreamHandlers, type STTStreamSession,
+} from "./providers";
 
 const API_URL = "https://api.anthropic.com/v1/messages";
 const BATCHES_URL = "https://api.anthropic.com/v1/messages/batches";
@@ -25,14 +31,24 @@ function deriveCallerIdFromStack(): string | null {
   return null;
 }
 
+export type ApiProvider = "anthropic" | "hugging-face" | "openai" | "google" | "mistral" | "groq" | "elevenlabs";
+
+export interface ApiKeyEntry {
+  id: string;
+  label: string;
+  key: string;
+  provider: ApiProvider;
+}
+
 export interface RelaySettings {
-  anthropicApiKey: string;
-  trivialApiKey: string;
+  apiKeys: ApiKeyEntry[];
   requestTimeoutMs: number;
+  hfTimeoutMs?: number;
 }
 
 export interface RequestOptions {
   priority?: number;
+  /** @deprecated kept for backwards compat; ignored — keys are now load-balanced automatically. */
   trivial?: boolean;
   signal?: AbortSignal;
   batch?: boolean;
@@ -42,6 +58,7 @@ export interface RequestOptions {
 export interface BatchEnqueueOptions {
   customId: string;
   callerId: string;
+  /** @deprecated kept for backwards compat; ignored. */
   trivial?: boolean;
 }
 
@@ -54,13 +71,12 @@ export type BatchResultHandler = (customId: string, result: BatchResult) => void
 export interface PersistedBatchEntry {
   customId: string;
   callerId: string;
-  trivial: boolean;
   body: Record<string, unknown>;
 }
 
 export interface PersistedPendingBatch {
   batchId: string;
-  role: "main" | "trivial";
+  keyId: string;
   submittedAt: number;
   entries: Array<{ customId: string; callerId: string }>;
 }
@@ -83,8 +99,9 @@ const MAX_RETRIES = 2;
 const INITIAL_BACKOFF_MS = 1000;
 const MAX_QUEUE_SIZE = 64;
 const MAX_TOKENS_CAP = 32768;
-const DEFAULT_CONCURRENCY = 2;
-const MAX_CONCURRENCY_CAP = 8;
+const PER_KEY_CONCURRENCY = 1;
+const DEFAULT_DISPATCH_INTERVAL_MS = 750;
+const THROTTLE_HEADROOM = 0.25;
 const RESPONSE_CACHE_TTL_MS = 60_000;
 const RESPONSE_CACHE_MAX = 64;
 
@@ -148,7 +165,7 @@ interface QueueEntry {
   body: Record<string, unknown>;
   bodyKey: string;              // pre-computed JSON.stringify(body)
   apiKey: string;               // resolved at enqueue time
-  cacheKey: string;             // apiKey + "\0" + bodyKey
+  cacheKey: string;             // bodyKey (key-agnostic — keys are load-balanced)
   priority: number;
   callerId: string;
   enqueuedAt: number;
@@ -162,7 +179,7 @@ interface ActiveRecord {
   id: number;
   callerId: string;
   model: string;
-  role: "main" | "trivial";
+  label: string;
   priority: number;
   startedAt: number;
   cancelled: boolean;
@@ -183,7 +200,7 @@ export interface HistoryEntry {
   id: number;
   callerId: string;
   model: string;
-  role: "main" | "trivial";
+  label: string;
   priority: number;
   mode: "sync" | "batch";
   startedAt: number;
@@ -200,7 +217,7 @@ export interface HistoryEntry {
 const HISTORY_MAX = 200;
 
 export interface RateLimitInfo {
-  role: "main" | "trivial";
+  label: string;
   requestsLimit: number;
   requestsRemaining: number;
   requestsReset: number;
@@ -228,11 +245,16 @@ export class Relay {
   private activeTotal = 0;
   private activeListener?: (active: number) => void;
   private changeListener?: () => void;
+  private pauseChangeListener?: () => void;
   private changePending = false;
   private drainScheduled = false;
   private paused = false;
+  /** Per-key auto-pause state. Key = keyId (stable across rotation). Value = resume timestamp, or null = indefinite. */
+  private keyPauseUntil = new Map<string, number | null>();
+  private keyResumeTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private rateLimitUntil = new Map<string, number>();
-  private rateLimitsRaw = new Map<string, Omit<RateLimitInfo, "role" | "concurrency">>();
+  private rateLimitsRaw = new Map<string, Omit<RateLimitInfo, "label" | "concurrency">>();
+  private lastDispatchAt = new Map<string, number>();
   private responseCache = new Map<string, CacheEntry>();
   private stats: RelayStats = {
     totalRequests: 0,
@@ -252,26 +274,385 @@ export class Relay {
   private batchPollTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private shutdownFlag = false;
 
+  private hfClient: HFClient;
+  private hfChatClient: HFChatClient;
+  private openaiClient: OpenAIClient;
+  private mistralClient: MistralClient;
+  private groqClient: GroqClient;
+  private geminiClient: GeminiClient;
+  private elevenlabsClient: ElevenLabsClient;
+
   constructor(settings: RelaySettings, batchPersistence?: BatchPersistence) {
     this.settings = settings;
     if (batchPersistence) {
       this.batchState = batchPersistence.initial;
       this.persistBatch = batchPersistence.save;
     }
+    const sideTimeout = settings.hfTimeoutMs ?? settings.requestTimeoutMs;
+    this.hfClient = new HFClient({ apiToken: this.providerToken("hugging-face"), timeoutMs: sideTimeout });
+    this.hfClient.setStatsListener((stats) => this.recordHFCall(stats));
+
+    this.openaiClient = new OpenAIClient({ apiToken: this.providerToken("openai"), timeoutMs: sideTimeout });
+    this.mistralClient = new MistralClient({ apiToken: this.providerToken("mistral"), timeoutMs: sideTimeout });
+    this.groqClient = new GroqClient({ apiToken: this.providerToken("groq"), timeoutMs: sideTimeout });
+    this.geminiClient = new GeminiClient({ apiToken: this.providerToken("google"), timeoutMs: sideTimeout });
+    this.hfChatClient = new HFChatClient({ apiToken: this.providerToken("hugging-face"), timeoutMs: sideTimeout });
+    this.elevenlabsClient = new ElevenLabsClient({ apiToken: this.providerToken("elevenlabs"), timeoutMs: sideTimeout });
+    const onProviderStats = (s: ProviderCallStats) => this.recordProviderCall(s);
+    this.openaiClient.setStatsListener(onProviderStats);
+    this.mistralClient.setStatsListener(onProviderStats);
+    this.groqClient.setStatsListener(onProviderStats);
+    this.geminiClient.setStatsListener(onProviderStats);
+    this.hfChatClient.setStatsListener(onProviderStats);
+    this.elevenlabsClient.setStatsListener(onProviderStats);
   }
 
   updateSettings(settings: RelaySettings): void {
     this.settings = settings;
+    const sideTimeout = settings.hfTimeoutMs ?? settings.requestTimeoutMs;
+    this.hfClient.updateSettings({ apiToken: this.providerToken("hugging-face"), timeoutMs: sideTimeout });
+    this.openaiClient.updateSettings({ apiToken: this.providerToken("openai"), timeoutMs: sideTimeout });
+    this.mistralClient.updateSettings({ apiToken: this.providerToken("mistral"), timeoutMs: sideTimeout });
+    this.groqClient.updateSettings({ apiToken: this.providerToken("groq"), timeoutMs: sideTimeout });
+    this.geminiClient.updateSettings({ apiToken: this.providerToken("google"), timeoutMs: sideTimeout });
+    this.hfChatClient.updateSettings({ apiToken: this.providerToken("hugging-face"), timeoutMs: sideTimeout });
+    this.elevenlabsClient.updateSettings({ apiToken: this.providerToken("elevenlabs"), timeoutMs: sideTimeout });
+  }
+
+  private providerToken(provider: ApiProvider): string {
+    return this.settings.apiKeys.find(e => e.provider === provider && e.key)?.key ?? "";
+  }
+
+  private anthropicKeys(): ApiKeyEntry[] {
+    return this.settings.apiKeys.filter(e => e.key && e.provider === "anthropic");
+  }
+
+  isHFConfigured(): boolean {
+    return this.hfClient.isConfigured();
+  }
+
+  /**
+   * Validate an API key by hitting a cheap auth-only endpoint per provider.
+   * Doesn't consume model tokens — just checks credentials.
+   * Returns { ok: true } for HTTP 2xx, otherwise { ok: false, status, error }.
+   */
+  async testKey(provider: ApiProvider, key: string): Promise<{ ok: boolean; status?: number; error?: string }> {
+    if (!key) return { ok: false, error: "no key" };
+
+    let url: string;
+    let headers: Record<string, string> = {};
+
+    switch (provider) {
+      case "anthropic":
+        url = "https://api.anthropic.com/v1/models";
+        headers = { "x-api-key": key, "anthropic-version": API_VERSION };
+        break;
+      case "openai":
+        url = "https://api.openai.com/v1/models";
+        headers = { "Authorization": `Bearer ${key}` };
+        break;
+      case "mistral":
+        url = "https://api.mistral.ai/v1/models";
+        headers = { "Authorization": `Bearer ${key}` };
+        break;
+      case "groq":
+        url = "https://api.groq.com/openai/v1/models";
+        headers = { "Authorization": `Bearer ${key}` };
+        break;
+      case "google":
+        url = `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(key)}`;
+        break;
+      case "hugging-face":
+        url = "https://huggingface.co/api/whoami-v2";
+        headers = { "Authorization": `Bearer ${key}` };
+        break;
+      case "elevenlabs":
+        url = "https://api.elevenlabs.io/v1/voices";
+        headers = { "xi-api-key": key };
+        break;
+      default:
+        return { ok: false, error: `unknown provider: ${provider}` };
+    }
+
+    try {
+      const resp = await requestUrl({ url, method: "GET", headers, throw: false });
+      if (resp.status >= 200 && resp.status < 300) {
+        return { ok: true, status: resp.status };
+      }
+      let errMsg = "";
+      try {
+        const json = resp.json;
+        if (json?.error?.message) errMsg = json.error.message;
+        else if (typeof json?.error === "string") errMsg = json.error;
+        else if (json?.message) errMsg = json.message;
+      } catch { /* ignore parse errors */ }
+      return { ok: false, status: resp.status, error: errMsg || `HTTP ${resp.status}` };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  }
+
+  /**
+   * Zero-shot classification via HF Inference API (NLI under the hood).
+   * Default model: `MoritzLaurer/deberta-v3-base-zeroshot-v2.0`.
+   * Pass `multiLabel: true` when multiple labels can apply independently.
+   */
+  async classify(
+    text: string,
+    candidateLabels: string[],
+    options?: HFRequestOptions & { model?: string; multiLabel?: boolean; hypothesisTemplate?: string },
+  ): Promise<ZeroShotResult> {
+    const model = options?.model ?? "MoritzLaurer/deberta-v3-base-zeroshot-v2.0";
+    const callerId = options?.callerId ?? deriveCallerIdFromStack() ?? "?";
+    return this.hfClient.classify(text, candidateLabels, model, { ...options, callerId });
+  }
+
+  /**
+   * Cross-encoder NLI: probability that `premise` entails `hypothesis`.
+   * Default model: `cross-encoder/nli-deberta-v3-base`.
+   */
+  async nli(
+    premise: string,
+    hypothesis: string,
+    options?: HFRequestOptions & { model?: string },
+  ): Promise<NLIResult> {
+    const model = options?.model ?? "cross-encoder/nli-deberta-v3-base";
+    const callerId = options?.callerId ?? deriveCallerIdFromStack() ?? "?";
+    return this.hfClient.nli(premise, hypothesis, model, { ...options, callerId });
+  }
+
+  /**
+   * Sentence embeddings. Default model: `sentence-transformers/all-MiniLM-L6-v2`.
+   * Returns one vector per input.
+   */
+  async embed(
+    texts: string[],
+    options?: HFRequestOptions & { model?: string },
+  ): Promise<number[][]> {
+    const model = options?.model ?? "sentence-transformers/all-MiniLM-L6-v2";
+    const callerId = options?.callerId ?? deriveCallerIdFromStack() ?? "?";
+    return this.hfClient.embed(texts, model, { ...options, callerId });
+  }
+
+  /**
+   * Low-level passthrough for any HF Inference API task not covered above
+   * (e.g. summarization, NER). The caller is responsible for shaping the
+   * payload and parsing the response.
+   */
+  async hfRaw<T>(
+    model: string,
+    payload: unknown,
+    task: string,
+    options?: HFRequestOptions,
+  ): Promise<T> {
+    const callerId = options?.callerId ?? deriveCallerIdFromStack() ?? "?";
+    return this.hfClient.raw<T>(model, payload, task, { ...options, callerId });
+  }
+
+  isOpenAIConfigured(): boolean { return this.openaiClient.isConfigured(); }
+  isMistralConfigured(): boolean { return this.mistralClient.isConfigured(); }
+  isGroqConfigured(): boolean { return this.groqClient.isConfigured(); }
+  isGeminiConfigured(): boolean { return this.geminiClient.isConfigured(); }
+  isElevenLabsConfigured(): boolean { return this.elevenlabsClient.isConfigured(); }
+
+  async elevenLabsTTS(
+    text: string,
+    voiceId: string,
+    options?: ClientRequestOptions & { modelId?: string },
+  ): Promise<ArrayBuffer> {
+    const callerId = options?.callerId ?? deriveCallerIdFromStack() ?? "?";
+    return this.elevenlabsClient.tts(text, voiceId, { ...options, callerId });
+  }
+
+  async elevenLabsSTT(
+    audioBlob: Blob,
+    options?: ClientRequestOptions,
+  ): Promise<string> {
+    const callerId = options?.callerId ?? deriveCallerIdFromStack() ?? "?";
+    return this.elevenlabsClient.stt(audioBlob, { ...options, callerId });
+  }
+
+  async elevenLabsSTTStream(
+    handlers: STTStreamHandlers,
+    options?: ClientRequestOptions,
+  ): Promise<STTStreamSession> {
+    const callerId = options?.callerId ?? deriveCallerIdFromStack() ?? "?";
+    return this.elevenlabsClient.sttStream(handlers, { ...options, callerId });
+  }
+
+  /** Pre-fetch a single-use STT token so the next sttStream() call connects faster. */
+  async prewarmSTT(options?: ClientRequestOptions): Promise<void> {
+    const callerId = options?.callerId ?? deriveCallerIdFromStack() ?? "?";
+    return this.elevenlabsClient.prewarmSTT({ ...options, callerId });
+  }
+
+  async elevenLabsVoices(
+    options?: ClientRequestOptions,
+  ): Promise<ElevenLabsVoice[]> {
+    const callerId = options?.callerId ?? deriveCallerIdFromStack() ?? "?";
+    return this.elevenlabsClient.voices({ ...options, callerId });
+  }
+
+  /**
+   * Passthrough OpenAI Chat Completions. Body is forwarded as-is — caller owns
+   * the shape (model, messages, max_tokens, tools, etc.). Independent of the
+   * Anthropic queue: no multi-key load balancing, no prompt cache, no batches.
+   */
+  async openaiRequest<T = Record<string, unknown>>(
+    body: Record<string, unknown>,
+    options?: ClientRequestOptions,
+  ): Promise<T> {
+    const callerId = options?.callerId ?? deriveCallerIdFromStack() ?? "?";
+    return this.openaiClient.chat<T>(body, { ...options, callerId });
+  }
+
+  /**
+   * Passthrough HuggingFace OpenAI-compatible chat completions via the HF Inference router.
+   * Body must include `model` (e.g. "NousResearch/Hermes-4-70B"). The HF router applies the
+   * model's canonical chat template server-side, so callers don't need to format ChatML or
+   * other model-specific templates. Independent of `classify`/`nli`/`embed`/`hfRaw`, which
+   * use the older `api-inference.huggingface.co/models/{model}` endpoint.
+   */
+  async hfChatCompletions<T = Record<string, unknown>>(
+    body: Record<string, unknown>,
+    options?: ClientRequestOptions,
+  ): Promise<T> {
+    const callerId = options?.callerId ?? deriveCallerIdFromStack() ?? "?";
+    return this.hfChatClient.chat<T>(body, { ...options, callerId });
+  }
+
+  /** Passthrough Mistral Chat Completions. See `openaiRequest` for caveats. */
+  async mistralRequest<T = Record<string, unknown>>(
+    body: Record<string, unknown>,
+    options?: ClientRequestOptions,
+  ): Promise<T> {
+    const callerId = options?.callerId ?? deriveCallerIdFromStack() ?? "?";
+    return this.mistralClient.chat<T>(body, { ...options, callerId });
+  }
+
+  /** Passthrough Groq Chat Completions (OpenAI-compatible). See `openaiRequest` for caveats. */
+  async groqRequest<T = Record<string, unknown>>(
+    body: Record<string, unknown>,
+    options?: ClientRequestOptions,
+  ): Promise<T> {
+    const callerId = options?.callerId ?? deriveCallerIdFromStack() ?? "?";
+    return this.groqClient.chat<T>(body, { ...options, callerId });
+  }
+
+  /**
+   * Passthrough Gemini generateContent. Model goes in the URL (Gemini's convention),
+   * body is forwarded as-is. Pass `method: "streamGenerateContent"` in options to hit
+   * the streaming endpoint instead — the client returns the raw response either way.
+   */
+  async geminiRequest<T = Record<string, unknown>>(
+    model: string,
+    body: Record<string, unknown>,
+    options?: ClientRequestOptions & { method?: "generateContent" | "streamGenerateContent" },
+  ): Promise<T> {
+    const callerId = options?.callerId ?? deriveCallerIdFromStack() ?? "?";
+    return this.geminiClient.generateContent<T>(model, body, { ...options, callerId });
+  }
+
+  private recordProviderCall(s: ProviderCallStats): void {
+    this.stats.totalRequests += 1;
+    this.stats.attempts += 1;
+    if (s.status === "error") this.stats.errors += 1;
+    const cs = this.getCallerStats(s.callerId);
+    cs.requests += 1;
+    if (s.status === "error") cs.errors += 1;
+    if (s.inputTokens) cs.inputTokens += s.inputTokens;
+    if (s.outputTokens) cs.outputTokens += s.outputTokens;
+    this.history.unshift({
+      id: this.nextEntryId++,
+      callerId: s.callerId,
+      model: s.model,
+      label: s.provider,
+      priority: 5,
+      mode: "sync",
+      startedAt: s.startedAt,
+      endedAt: s.endedAt,
+      status: s.status === "ok" ? "ok" : "error",
+      inputTokens: s.inputTokens ?? 0,
+      outputTokens: s.outputTokens ?? 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      error: s.error,
+    });
+    if (this.history.length > HISTORY_MAX) this.history.length = HISTORY_MAX;
+    this.notifyChange();
+  }
+
+  private recordHFCall(_stats: { callerId: string; model: string; task: string; status: "ok" | "error"; error?: string; startedAt: number; endedAt: number }): void {
+    // Counted as a request for top-line stats. Token usage is unavailable from HF.
+    this.stats.totalRequests += 1;
+    this.stats.attempts += 1;
+    if (_stats.status === "error") this.stats.errors += 1;
+    const cs = this.getCallerStats(_stats.callerId);
+    cs.requests += 1;
+    if (_stats.status === "error") cs.errors += 1;
+    this.history.unshift({
+      id: this.nextEntryId++,
+      callerId: _stats.callerId,
+      model: _stats.model,
+      label: `hf:${_stats.task}`,
+      priority: 5,
+      mode: "sync",
+      startedAt: _stats.startedAt,
+      endedAt: _stats.endedAt,
+      status: _stats.status === "ok" ? "ok" : "error",
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      error: _stats.error,
+    });
+    if (this.history.length > HISTORY_MAX) this.history.length = HISTORY_MAX;
+    this.notifyChange();
   }
 
   getRateLimits(): RateLimitInfo[] {
     const result: RateLimitInfo[] = [];
     for (const [key, raw] of this.rateLimitsRaw) {
-      const role = (this.settings.trivialApiKey && key === this.settings.trivialApiKey) ? "trivial" as const : "main" as const;
-      const concurrency = Math.max(1, Math.min(MAX_CONCURRENCY_CAP, raw.requestsLimit));
-      result.push({ ...raw, role, concurrency });
+      result.push({ ...raw, label: this.labelFor(key), concurrency: PER_KEY_CONCURRENCY });
     }
     return result;
+  }
+
+  private labelFor(apiKey: string): string {
+    const entry = this.settings.apiKeys.find(e => e.key === apiKey);
+    return entry?.label || "unknown";
+  }
+
+  private entryById(id: string): ApiKeyEntry | undefined {
+    return this.settings.apiKeys.find(e => e.id === id);
+  }
+
+  private chooseKey(opts?: { excludePaused?: boolean }): { id: string; key: string } | null {
+    const candidates = this.anthropicKeys().filter(e => !(opts?.excludePaused && this.isKeyPaused(e.id)));
+    if (candidates.length === 0) return null;
+
+    const now = Date.now();
+    const score = (key: string): number => {
+      // Hard penalty for keys we know are in backoff right now.
+      const rlUntil = this.rateLimitUntil.get(key) || 0;
+      if (now < rlUntil) return -1 - (rlUntil - now) / 1000;
+
+      const info = this.rateLimitsRaw.get(key);
+      const reqRatio = !info ? 1
+        : info.requestsReset && info.requestsReset <= now ? 1
+        : info.requestsLimit > 0 ? info.requestsRemaining / info.requestsLimit : 1;
+      const tokRatio = !info ? 1
+        : info.tokensReset && info.tokensReset <= now ? 1
+        : info.tokensLimit > 0 ? info.tokensRemaining / info.tokensLimit : 1;
+      const cap = this.maxConcurrencyFor(key);
+      const queuedAgainstKey = this.queue.reduce((n, e) => n + (e.apiKey === key ? 1 : 0), 0);
+      const loadPenalty = ((this.getActive(key) + queuedAgainstKey) / cap) * 0.25;
+      return Math.min(reqRatio, tokRatio) - loadPenalty;
+    };
+    const ranked = candidates
+      .map(e => ({ id: e.id, key: e.key, s: score(e.key) }))
+      .sort((a, b) => b.s - a.s);
+    return { id: ranked[0].id, key: ranked[0].key };
   }
 
   getStats(): RelayStats {
@@ -286,6 +667,8 @@ export class Relay {
       entry.reject(new Error("Iris Relay: plugin unloading."));
     }
     this.responseCache.clear();
+    for (const t of this.keyResumeTimers.values()) clearTimeout(t);
+    this.keyResumeTimers.clear();
     for (const t of this.batchPollTimers.values()) clearTimeout(t);
     this.batchPollTimers.clear();
     this.batchHandlers.clear();
@@ -298,7 +681,14 @@ export class Relay {
     }
     const signal = options?.signal;
     if (signal?.aborted) throw new Error("Iris Relay: request aborted.");
-    if (!this.settings.anthropicApiKey) throw new Error("Iris Relay: no API key configured.");
+    if (this.paused) throw new Error("Iris Relay: relay is paused.");
+    const chosen = this.chooseKey({ excludePaused: true });
+    if (!chosen) {
+      if (this.anthropicKeys().length === 0) {
+        throw new Error("Iris Relay: no Anthropic API key configured.");
+      }
+      throw new Error("Iris Relay: all Anthropic API keys are paused.");
+    }
     if (this.queue.length >= MAX_QUEUE_SIZE) throw new Error("Iris Relay: queue full, try again later.");
 
     this.stats.totalRequests++;
@@ -306,11 +696,9 @@ export class Relay {
     const priority = typeof options?.priority === "number"
       ? Math.max(0, Math.min(10, options.priority))
       : DEFAULT_PRIORITY;
-    const apiKey = (options?.trivial && this.settings.trivialApiKey)
-      ? this.settings.trivialApiKey
-      : this.settings.anthropicApiKey;
+    const apiKey = chosen.key;
     const bodyKey = JSON.stringify(validated);
-    const cacheKey = apiKey + "\0" + bodyKey;
+    const cacheKey = bodyKey;
 
     const cached = this.responseCache.get(cacheKey);
     if (cached && Date.now() < cached.expiresAt) {
@@ -365,10 +753,14 @@ export class Relay {
     }
   }
 
-  private maxConcurrencyFor(apiKey: string): number {
+  private maxConcurrencyFor(_apiKey: string): number {
+    return PER_KEY_CONCURRENCY;
+  }
+
+  private minDispatchIntervalFor(apiKey: string): number {
     const info = this.rateLimitsRaw.get(apiKey);
-    if (!info) return DEFAULT_CONCURRENCY;
-    return Math.max(1, Math.min(MAX_CONCURRENCY_CAP, info.requestsLimit));
+    if (!info || info.requestsLimit <= 0) return DEFAULT_DISPATCH_INTERVAL_MS;
+    return Math.ceil(60_000 / (info.requestsLimit * 0.8));
   }
 
   private getActive(apiKey: string): number {
@@ -387,6 +779,10 @@ export class Relay {
 
   setChangeListener(listener: (() => void) | undefined): void {
     this.changeListener = listener;
+  }
+
+  setPauseChangeListener(listener: (() => void) | undefined): void {
+    this.pauseChangeListener = listener;
   }
 
   private notifyChange(): void {
@@ -409,8 +805,120 @@ export class Relay {
   setPaused(paused: boolean): void {
     if (this.paused === paused) return;
     this.paused = paused;
+    if (paused) this.failQueued("relay is paused.");
     this.notifyChange();
+    this.pauseChangeListener?.();
     if (!paused) this.scheduleDrain();
+  }
+
+  private failQueued(reason: string): void {
+    if (this.queue.length === 0) return;
+    for (const entry of this.queue.splice(0)) {
+      this.cleanupAbortListener(entry);
+      this.stats.errors++;
+      this.bumpCaller(entry.callerId, "errors", 1);
+      entry.reject(new Error(`Iris Relay: ${reason}`));
+    }
+    this.notifyChange();
+  }
+
+  private allKeysPaused(): boolean {
+    const configured = this.anthropicKeys();
+    return configured.length > 0 && configured.every(e => this.isKeyPaused(e.id));
+  }
+
+  /** True if the key is auto-paused right now. Lazily cleans up expired entries. */
+  isKeyPaused(keyId: string): boolean {
+    if (!this.keyPauseUntil.has(keyId)) return false;
+    const until = this.keyPauseUntil.get(keyId);
+    if (until !== null && Date.now() >= until!) {
+      this.clearKeyPauseInternal(keyId);
+      return false;
+    }
+    return true;
+  }
+
+  /** Snapshot of all per-key pauses for persistence and UI. */
+  getKeyPauses(): Array<{ keyId: string; until: number | null }> {
+    const result: Array<{ keyId: string; until: number | null }> = [];
+    for (const [keyId, until] of this.keyPauseUntil) {
+      if (until !== null && Date.now() >= until) continue;
+      result.push({ keyId, until });
+    }
+    return result;
+  }
+
+  /**
+   * Pause or resume a single key.
+   * `until` = future timestamp for auto-resume, or null = indefinite (manual resume only).
+   * Pass paused=false to clear.
+   */
+  setKeyPause(keyId: string, paused: boolean, until: number | null = null): void {
+    if (!paused) {
+      if (!this.keyPauseUntil.has(keyId)) return;
+      this.clearKeyPauseInternal(keyId);
+      this.notifyChange();
+      this.pauseChangeListener?.();
+      this.scheduleDrain();
+      return;
+    }
+
+    const safeUntil = until !== null && until > Date.now() ? until : null;
+    const prev = this.keyPauseUntil.get(keyId);
+    if (this.keyPauseUntil.has(keyId) && prev === safeUntil) return;
+
+    this.clearKeyResumeTimer(keyId);
+    this.keyPauseUntil.set(keyId, safeUntil);
+    if (safeUntil !== null) {
+      const timer = setTimeout(() => {
+        this.keyResumeTimers.delete(keyId);
+        if (this.keyPauseUntil.get(keyId) === safeUntil) {
+          const label = this.entryById(keyId)?.label || keyId;
+          new Notice(`Iris Relay: auto-resuming "${label}" after rate-limit window expired.`, 6000);
+          this.setKeyPause(keyId, false);
+        }
+      }, Math.max(0, safeUntil - Date.now()));
+      this.keyResumeTimers.set(keyId, timer);
+    }
+    if (this.allKeysPaused()) this.failQueued("all API keys are paused.");
+    this.notifyChange();
+    this.pauseChangeListener?.();
+  }
+
+  private clearKeyResumeTimer(keyId: string): void {
+    const t = this.keyResumeTimers.get(keyId);
+    if (t !== undefined) {
+      clearTimeout(t);
+      this.keyResumeTimers.delete(keyId);
+    }
+  }
+
+  private clearKeyPauseInternal(keyId: string): void {
+    this.clearKeyResumeTimer(keyId);
+    this.keyPauseUntil.delete(keyId);
+  }
+
+  private isFatalAccountError(status: number, message: string): boolean {
+    if (status === 401 || status === 403) return true;
+    if (status === 400 && /specified API limit|credit balance is too low|reached your.*limit|usage limit/i.test(message)) return true;
+    return false;
+  }
+
+  /** Parse "regain access on YYYY-MM-DD at HH:MM UTC" out of the API error message. */
+  private parseRegainAccessTime(message: string): number | null {
+    const m = /regain access on (\d{4}-\d{2}-\d{2}) at (\d{2}:\d{2})\s*UTC/i.exec(message);
+    if (!m) return null;
+    const ts = Date.parse(`${m[1]}T${m[2]}:00Z`);
+    return Number.isFinite(ts) ? ts : null;
+  }
+
+  private notifyFatal(label: string, message: string, status: number, until: number | null): void {
+    const suffix = until ? ` Auto-resuming at ${new Date(until).toISOString().replace(/\.\d+Z$/, "Z")}.` : "";
+    new Notice(`Iris Relay paused key "${label}": ${message} (HTTP ${status}).${suffix}`, 10000);
+  }
+
+  private keyIdForApiKey(apiKey: string): string | undefined {
+    return this.settings.apiKeys.find(e => e.key === apiKey)?.id;
   }
 
   private drain(): void {
@@ -427,7 +935,28 @@ export class Relay {
         continue;
       }
 
-      const { apiKey } = entry;
+      // First check: any Anthropic keys configured at all? If not, fail fast.
+      if (this.anthropicKeys().length === 0) {
+        this.queue.splice(i, 1);
+        this.cleanupAbortListener(entry);
+        entry.reject(new Error("Iris Relay: no Anthropic API key configured."));
+        continue;
+      }
+
+      const chosen = this.chooseKey({ excludePaused: true });
+      if (!chosen) {
+        // Defensive: setPaused / setKeyPause should have already failed the queue,
+        // but if a race lands an entry here with no dispatchable key, fail it now
+        // rather than letting it hang.
+        this.queue.splice(i, 1);
+        this.cleanupAbortListener(entry);
+        this.stats.errors++;
+        this.bumpCaller(entry.callerId, "errors", 1);
+        entry.reject(new Error("Iris Relay: all Anthropic API keys are paused."));
+        continue;
+      }
+      const apiKey = chosen.key;
+      entry.apiKey = apiKey;
 
       const rlUntil = this.rateLimitUntil.get(apiKey) || 0;
       if (now < rlUntil) {
@@ -447,14 +976,22 @@ export class Relay {
         continue;
       }
 
+      const nextDispatchAt = (this.lastDispatchAt.get(apiKey) || 0) + this.minDispatchIntervalFor(apiKey);
+      if (now < nextDispatchAt) {
+        earliestRetry = Math.min(earliestRetry, nextDispatchAt);
+        i++;
+        continue;
+      }
+
       this.queue.splice(i, 1);
       this.cleanupAbortListener(entry);
+      this.lastDispatchAt.set(apiKey, now);
       this.adjustActive(apiKey, 1);
       const record: ActiveRecord = {
         id: entry.id,
         callerId: entry.callerId,
         model: String(entry.body.model || "?"),
-        role: (this.settings.trivialApiKey && apiKey === this.settings.trivialApiKey ? "trivial" : "main"),
+        label: this.labelFor(apiKey),
         priority: entry.priority,
         startedAt: Date.now(),
         cancelled: false,
@@ -463,7 +1000,9 @@ export class Relay {
       this.notifyChange();
       this.execute(entry, record).finally(() => {
         this.activeRecords.delete(entry.id);
-        this.adjustActive(apiKey, -1);
+        // Use entry.apiKey (not the drain-time `apiKey` const) — executeInner may have
+        // switched the entry to a different key on retry.
+        this.adjustActive(entry.apiKey, -1);
         this.drain();
       });
     }
@@ -480,8 +1019,8 @@ export class Relay {
     const now = Date.now();
     if (now >= info.tokensReset && now >= info.requestsReset) return false;
 
-    if (info.tokensRemaining < info.tokensLimit * 0.1) return true;
-    if (info.requestsRemaining < info.requestsLimit * 0.1) return true;
+    if (info.tokensRemaining < info.tokensLimit * THROTTLE_HEADROOM) return true;
+    if (info.requestsRemaining < info.requestsLimit * THROTTLE_HEADROOM) return true;
     return false;
   }
 
@@ -541,7 +1080,8 @@ export class Relay {
   private async executeInner(entry: QueueEntry, record: ActiveRecord): Promise<Record<string, unknown>> {
     let lastError: Error | null = null;
     const serializedBody = JSON.stringify(injectCacheControl(entry.body));
-    const { apiKey, cacheKey, signal } = entry;
+    const { cacheKey, signal } = entry;
+    let apiKey = entry.apiKey;
 
     const fail = (err: Error, status: HistoryEntry["status"]): never => {
       (err as any).__irisHandled = true;
@@ -562,6 +1102,15 @@ export class Relay {
         this.bumpCaller(record.callerId, "retries", 1);
         const delay = INITIAL_BACKOFF_MS * Math.pow(2, attempt - 1);
         await new Promise((r) => setTimeout(r, delay));
+        // Re-pick a key for this retry — the previous one may have just been rate-limited.
+        const next = this.chooseKey();
+        if (next && next.key !== apiKey) {
+          this.adjustActive(apiKey, -1);
+          this.adjustActive(next.key, +1);
+          apiKey = next.key;
+          entry.apiKey = apiKey;
+          record.label = this.labelFor(apiKey);
+        }
       }
 
       const now = Date.now();
@@ -614,6 +1163,14 @@ export class Relay {
 
         if (response.status >= 400) {
           const msg = response.json?.error?.message ?? `API ${response.status}`;
+          if (this.isFatalAccountError(response.status, msg)) {
+            const until = this.parseRegainAccessTime(msg);
+            const keyId = this.keyIdForApiKey(apiKey);
+            if (keyId) {
+              this.setKeyPause(keyId, true, until);
+              this.notifyFatal(this.labelFor(apiKey), msg, response.status, until);
+            }
+          }
           fail(new Error(`Iris Relay: ${msg}`), "error");
         }
 
@@ -655,7 +1212,7 @@ export class Relay {
   }
 
   private recordHistory(
-    record: { id: number; callerId: string; model: string; role: "main" | "trivial"; priority: number; startedAt: number; customId?: string },
+    record: { id: number; callerId: string; model: string; label: string; priority: number; startedAt: number; customId?: string },
     status: HistoryEntry["status"],
     response?: Record<string, unknown>,
     error?: string,
@@ -671,7 +1228,7 @@ export class Relay {
       id: record.id,
       callerId: record.callerId,
       model: record.model,
-      role: record.role,
+      label: record.label,
       priority: record.priority,
       mode,
       startedAt: record.startedAt,
@@ -707,7 +1264,7 @@ export class Relay {
     this.history.push({
       id: entry.id, callerId: entry.callerId,
       model: String(entry.body.model || "?"),
-      role: (this.settings.trivialApiKey && entry.apiKey === this.settings.trivialApiKey ? "trivial" : "main"),
+      label: this.labelFor(entry.apiKey),
       priority: entry.priority, mode: "sync",
       startedAt: entry.enqueuedAt, endedAt: Date.now(),
       status: "cancelled",
@@ -741,8 +1298,11 @@ export class Relay {
   async cancelBatchPending(batchId: string): Promise<boolean> {
     const pending = this.batchState.pending.find((p) => p.batchId === batchId);
     if (!pending) return false;
-    const apiKey = this.resolveKey(pending.role);
-    if (!apiKey) return false;
+    const apiKey = this.entryById(pending.keyId)?.key;
+    if (!apiKey) {
+      console.warn(`Iris Relay: cannot cancel batch ${batchId}, configured key missing.`);
+      return false;
+    }
     try {
       await requestUrl({
         url: `${BATCHES_URL}/${batchId}/cancel`,
@@ -759,11 +1319,6 @@ export class Relay {
 
   // ───── batch mode ─────
 
-  private resolveKey(role: "main" | "trivial"): string {
-    if (role === "trivial" && this.settings.trivialApiKey) return this.settings.trivialApiKey;
-    return this.settings.anthropicApiKey;
-  }
-
   private async saveBatchState(): Promise<void> {
     if (this.persistBatch) {
       try { await this.persistBatch(this.batchState); }
@@ -779,7 +1334,6 @@ export class Relay {
     this.batchState.queued.push({
       customId: opts.customId,
       callerId: opts.callerId,
-      trivial: !!opts.trivial,
       body: validated,
     });
     this.bumpCaller(opts.callerId, "requests", 1);
@@ -787,15 +1341,20 @@ export class Relay {
     this.notifyChange();
   }
 
-  async flushBatch(opts?: { trivial?: boolean }): Promise<string | null> {
-    const role: "main" | "trivial" = opts?.trivial ? "trivial" : "main";
-    const apiKey = this.resolveKey(role);
-    if (!apiKey) throw new Error("Iris Relay: no API key configured.");
+  async flushBatch(_opts?: { trivial?: boolean }): Promise<string | null> {
+    if (this.paused) throw new Error("Iris Relay: relay is paused.");
+    const chosen = this.chooseKey({ excludePaused: true });
+    if (!chosen) {
+      if (this.anthropicKeys().length === 0) {
+        throw new Error("Iris Relay: no Anthropic API key configured.");
+      }
+      throw new Error("Iris Relay: all Anthropic API keys are paused.");
+    }
 
-    const wantTrivial = !!opts?.trivial;
-    const matching = this.batchState.queued.filter((e) => e.trivial === wantTrivial);
+    const matching = this.batchState.queued;
     if (matching.length === 0) return null;
 
+    const apiKey = chosen.key;
     const requests = matching.map((e) => ({
       custom_id: e.customId,
       params: injectCacheControl(e.body),
@@ -823,6 +1382,11 @@ export class Relay {
 
     if (response.status >= 400) {
       const msg = response.json?.error?.message ?? `API ${response.status}`;
+      if (this.isFatalAccountError(response.status, msg)) {
+        const until = this.parseRegainAccessTime(msg);
+        this.setKeyPause(chosen.id, true, until);
+        this.notifyFatal(this.labelFor(apiKey), msg, response.status, until);
+      }
       throw new Error(`Iris Relay: batch submit failed: ${msg}`);
     }
 
@@ -831,10 +1395,10 @@ export class Relay {
       throw new Error("Iris Relay: batch submit returned no id.");
     }
 
-    this.batchState.queued = this.batchState.queued.filter((e) => e.trivial !== wantTrivial);
+    this.batchState.queued = [];
     this.batchState.pending.push({
       batchId,
-      role,
+      keyId: chosen.id,
       submittedAt: Date.now(),
       entries: matching.map((e) => ({ customId: e.customId, callerId: e.callerId })),
     });
@@ -861,31 +1425,28 @@ export class Relay {
   }
 
   getLiveSnapshot(): {
-    active: Array<{ id: number; model: string; role: "main" | "trivial"; priority: number; startedAt: number; callerId: string; cancelled: boolean }>;
-    queued: Array<{ id: number; model: string; role: "main" | "trivial"; priority: number; callerId: string }>;
-    batchQueued: Array<{ model: string; role: "main" | "trivial"; callerId: string; customId: string }>;
-    batchPending: Array<{ batchId: string; entries: number; submittedAt: number; role: "main" | "trivial"; items: Array<{ customId: string; callerId: string }> }>;
+    active: Array<{ id: number; model: string; label: string; priority: number; startedAt: number; callerId: string; cancelled: boolean }>;
+    queued: Array<{ id: number; model: string; label: string; priority: number; callerId: string }>;
+    batchQueued: Array<{ model: string; callerId: string; customId: string }>;
+    batchPending: Array<{ batchId: string; entries: number; submittedAt: number; label: string; items: Array<{ customId: string; callerId: string }> }>;
     history: HistoryEntry[];
     callerStats: Array<{ callerId: string } & CallerStats>;
     stats: RelayStats;
   } {
-    const trivialKey = this.settings.trivialApiKey;
-    const roleOf = (k: string): "main" | "trivial" => (trivialKey && k === trivialKey ? "trivial" : "main");
     return {
       active: Array.from(this.activeRecords.values()).map((r) => ({
-        id: r.id, callerId: r.callerId, model: r.model, role: r.role,
+        id: r.id, callerId: r.callerId, model: r.model, label: r.label,
         priority: r.priority, startedAt: r.startedAt, cancelled: r.cancelled,
       })),
       queued: this.queue.map((e) => ({
         id: e.id,
         model: String(e.body.model || "?"),
-        role: roleOf(e.apiKey),
+        label: this.labelFor(e.apiKey),
         priority: e.priority,
         callerId: e.callerId,
       })),
       batchQueued: this.batchState.queued.map((e) => ({
         model: String(e.body.model || "?"),
-        role: e.trivial ? "trivial" : "main",
         callerId: e.callerId,
         customId: e.customId,
       })),
@@ -893,7 +1454,7 @@ export class Relay {
         batchId: p.batchId,
         entries: p.entries.length,
         submittedAt: p.submittedAt,
-        role: p.role,
+        label: this.entryById(p.keyId)?.label || "unknown",
         items: p.entries.map((e) => ({ customId: e.customId, callerId: e.callerId })),
       })),
       history: this.history.slice().reverse(),
@@ -904,14 +1465,14 @@ export class Relay {
     };
   }
 
-  getBatchState(): { queued: number; pending: Array<{ batchId: string; entries: number; submittedAt: number; role: "main" | "trivial" }> } {
+  getBatchState(): { queued: number; pending: Array<{ batchId: string; entries: number; submittedAt: number; label: string }> } {
     return {
       queued: this.batchState.queued.length,
       pending: this.batchState.pending.map((p) => ({
         batchId: p.batchId,
         entries: p.entries.length,
         submittedAt: p.submittedAt,
-        role: p.role,
+        label: this.entryById(p.keyId)?.label || "unknown",
       })),
     };
   }
@@ -941,9 +1502,9 @@ export class Relay {
     const pending = this.batchState.pending.find((p) => p.batchId === batchId);
     if (!pending) return;
 
-    const apiKey = this.resolveKey(pending.role);
+    const apiKey = this.entryById(pending.keyId)?.key;
     if (!apiKey) {
-      console.warn(`Iris Relay: cannot poll batch ${batchId}, ${pending.role} key missing.`);
+      console.warn(`Iris Relay: cannot poll batch ${batchId}, configured key missing.`);
       this.schedulePoll(batchId, BATCH_POLL_SLOW_MS);
       return;
     }
@@ -1046,7 +1607,7 @@ export class Relay {
           id: this.nextEntryId++,
           callerId,
           model: String((response as any)?.model || "?"),
-          role: pending.role,
+          label: this.entryById(pending.keyId)?.label || "unknown",
           priority: 0,
           startedAt: pending.submittedAt,
           customId,
