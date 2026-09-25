@@ -422,7 +422,7 @@ The router provides text-to-speech, speech-to-text, and voice listing via the El
 relay.elevenLabsTTS(text: string, voiceId: string, options?: {
   callerId?: string;
   signal?: AbortSignal;
-  modelId?: string;        // default: "eleven_v3"
+  modelId?: string;        // default: "eleven_flash_v2_5"
 }): Promise<ArrayBuffer>
 
 // Speech-to-text — transcribes a WebM audio blob to text

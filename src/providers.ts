@@ -393,7 +393,7 @@ export class ElevenLabsClient extends BaseProviderClient {
 
     const callerId = options?.callerId ?? "?";
     const startedAt = Date.now();
-    const modelId = options?.modelId ?? "eleven_v3";
+    const modelId = options?.modelId ?? "eleven_flash_v2_5";
     const timeoutMs = this.settings.timeoutMs || DEFAULT_TIMEOUT_MS;
 
     let lastErr: Error | null = null;
