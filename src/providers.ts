@@ -318,6 +318,13 @@ const ELEVENLABS_BASE = "https://api.elevenlabs.io/v1";
 export interface ElevenLabsVoice {
   voice_id: string;
   name: string;
+  /** "premade", "cloned", "generated", "professional", ... */
+  category?: string;
+  description?: string;
+  /** ElevenLabs voice labels, e.g. { gender, age, accent, description, use_case }. */
+  labels?: Record<string, string>;
+  /** Short sample clip hosted by ElevenLabs. */
+  preview_url?: string;
 }
 
 export interface STTStreamHandlers {
@@ -614,7 +621,14 @@ export class ElevenLabsClient extends BaseProviderClient {
       });
       if (resp.status >= 400) throw new Error(`Iris ElevenLabs voices: ${resp.status}`);
       const voices: ElevenLabsVoice[] = (resp.json?.voices ?? []).map(
-        (v: { voice_id: string; name: string }) => ({ voice_id: v.voice_id, name: v.name }),
+        (v: ElevenLabsVoice) => ({
+          voice_id: v.voice_id,
+          name: v.name,
+          category: v.category ?? undefined,
+          description: v.description ?? undefined,
+          labels: v.labels ?? undefined,
+          preview_url: v.preview_url ?? undefined,
+        }),
       );
       this.emitStats({ callerId, provider: "elevenlabs", model: "voices", startedAt, endedAt: Date.now(), status: "ok" });
       return voices;
